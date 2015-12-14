@@ -149,7 +149,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     mailto = 'list of email addresses to which we should send results'
-    parser.add_argument("-", "--mailto", help=mailto, nargs="+")
+    parser.add_argument("-m", "--mailto", help=mailto, nargs="+")
 
     return parser.parse_args()
 
