@@ -23,8 +23,10 @@ import email.mime.base
 import email.mime.multipart
 import email.mime.text
 import email.utils
+import glob
 import os
 import smtplib
+import yaml
 
 from lxml import etree, html
 
@@ -34,36 +36,44 @@ from lxml import etree, html
 # ----------------------------- #
 
 URL = 'http://www.senate.gov/employment/po/positions.htm'
-FNAME = os.path.join(os.sep, 'tmp', 'senatejobs', 'jobs.{d:%Y%m%d}.csv')
-TDY = datetime.datetime.now()
-YST = datetime.datetime.now() - datetime.timedelta(days=1)
-FTDY = FNAME.format(d=TDY)
-FYST = FNAME.format(d=YST)
-CS = email.utils.COMMASPACE
+FNAME = os.path.join(os.sep, 'tmp', 'senatejobs', 'jobs.{d:%Y%m%d%H%m}.csv')
+FLAST = os.path.join(os.sep, 'tmp', 'senatejobs', 'jobs.[0-9]*.csv')
+NOW = datetime.datetime.now()
+FNOW = FNAME.format(d=NOW)
 FROMADDR = "R. Zach Lamberty <r.zach.lamberty@gmail.com>"
+SERVER = 'smtp.gmail.com'
+FCRED = os.path.expanduser(os.path.join('~', '.secrets', 'gmail.yaml'))
 
 
 # ----------------------------- #
 #   Main routine                #
 # ----------------------------- #
 
-def main(url=URL, fystpos=FYST, ftdypos=FTDY, mailto=None):
-    """ docstring """
-    ystpos = load_yesterdays_positions(fystpos)
+def main(url=URL, flast=FLAST, fout=FNOW, mailto=None, server=SERVER,
+         credfile=FCRED, mailempty=False):
+    ystpos = load_most_recent_positions(flast)
     nowpos = get_positions(url)
     newpos = [
         pos for pos in nowpos
-        if not pos['id'] in [pos['id'] for pos in ystpos]
+        if not pos['id'] in [oldpos['id'] for oldpos in ystpos]
     ]
-    publish(newpos, ftdypos, mailto)
+    publish(
+        newpos=newpos,
+        fout=fout,
+        mailto=mailto,
+        server=server,
+        credfile=credfile,
+        mailempty=mailempty
+    )
 
 
-def load_yesterdays_positions(fystpos=None):
+def load_most_recent_positions(flast=FLAST):
     try:
-        with open(fystpos, 'r') as f:
+        mostrecent = max(glob.glob(flast), key=lambda f: os.path.getmtime(f))
+        with open(mostrecent, 'r') as f:
             return list(csv.DictReader(f))
-    except IOError:
-        print "no file named {}, moving on".format(fystpos)
+    except ValueError:
+        print "no files matching {}, moving on".format(flast)
         return []
 
 
@@ -86,24 +96,29 @@ def get_positions(url=URL):
     return jobs
 
 
-def publish(newpos, ftdypos=FTDY, mailto=None):
+def publish(newpos, fout=FNOW, mailto=None, server=SERVER, credfile=FCRED,
+            mailempty=False):
     # file only gets written if newpos exists; email goes out either way (but
     # only if mailto exists)
-    subject = "New Senate Jobs {:%F}".format(TDY)
+    subject = "New Senate Jobs {:%F %X}".format(NOW)
     body = email_body(newpos)
     files = []
-    if newpos and ftdypos:
-        fdir = os.path.dirname(ftdypos)
+    if newpos and fout:
+        fdir = os.path.dirname(fout)
         if not os.path.exists(fdir):
             os.makedirs(fdir)
 
-        with open(ftdypos, 'wb') as f:
+        with open(fout, 'wb') as f:
             c = csv.DictWriter(f, fieldnames=newpos[0].keys())
             c.writeheader()
             c.writerows(newpos)
-        files.append(ftdypos)
-    if mailto:
-        send_mail(to=mailto, subject=subject, body=body, files=files)
+        files.append(fout)
+    if mailto and (newpos or mailempty):
+        print "Sending email to {}".format(mailto)
+        send_mail(
+            to=mailto, subject=subject, body=body, files=files, server=SERVER,
+            credfile=credfile
+        )
 
 
 def email_body(newpos):
@@ -115,10 +130,11 @@ def email_body(newpos):
         return "No new jobs"
 
 
-def send_mail(to, subject, body, files=[], server="localhost"):
+def send_mail(to, subject, body, files=[], server=SERVER, port=587,
+              credfile=FCRED):
     msg = email.mime.multipart.MIMEMultipart()
     msg['From'] = FROMADDR
-    msg['To'] = CS.join(to)
+    msg['To'] = email.utils.COMMASPACE.join(to)
     msg['Subject'] = subject
     msg.attach(
         email.mime.text.MIMEText(body, 'html')
@@ -135,9 +151,15 @@ def send_mail(to, subject, body, files=[], server="localhost"):
             )
             msg.attach(part)
 
-    smtp = smtplib.SMTP(server)
+    smtp = smtplib.SMTP(server, port)
+    smtp.ehlo()
+    smtp.starttls()
+    if credfile:
+        with open(credfile, 'rb') as f:
+            cred = yaml.load(f)
+        smtp.login(cred['user'], cred['password'])
     smtp.sendmail(FROMADDR, to, msg.as_string())
-    smtp.quit()
+    smtp.close()
 
 
 # ----------------------------- #
@@ -151,6 +173,15 @@ def parse_args():
     mailto = 'list of email addresses to which we should send results'
     parser.add_argument("-m", "--mailto", help=mailto, nargs="+")
 
+    server = "smtp server address"
+    parser.add_argument("-s", "--server", help=server, default=SERVER)
+
+    credfile = "path to credentials (yaml file with 'user', and 'password' keys)"
+    parser.add_argument("-c", "--credfile", help=credfile, default=FCRED)
+
+    mailempty = "Mail even if the results are empty (no new postings)"
+    parser.add_argument("--mailempty", help=mailempty, action='store_true')
+
     return parser.parse_args()
 
 
@@ -159,7 +190,10 @@ if __name__ == '__main__':
     args = parse_args()
     main(
         url=URL,
-        fystpos=FYST,
-        ftdypos=FTDY,
-        mailto=args.mailto
+        flast=FLAST,
+        fout=FNOW,
+        mailto=args.mailto,
+        server=args.server,
+        credfile=args.credfile,
+        mailempty=args.mailempty
     )
